@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
 
-const MODELS = ["gemini-3-flash-preview", "gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"];
+const MODELS = ["gemini-flash-latest", "gemini-3-flash-preview", "gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"];
 const SUGGESTIONS = [
   "example.com ka security scan karo",
   "OWASP Top 10 simple lafzon me samjhao",
