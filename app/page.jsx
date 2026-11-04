@@ -11,42 +11,42 @@ const SUGGESTIONS = [
 function load(key, fallback) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } }
 function save(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
 
-async function callGemini({ key, model, prompt }) {
-  // Fix for screenshot error: 503 "high demand" pehle break kar deta tha, ab retry + next model.
-  // Rule (12 Oct wali Brain fix jaisi): 404 = instant next model, 503/429 = backoff retry phir next model, 400/403 invalid key = foran ruk jao.
-  const tries = [model, ...MODELS.filter(m => m !== model)];
-  const tried = [];
-  for (const m of tries) {
-    tried.push(m);
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(key)}`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, an expert defensive security assistant. Only help with authorized targets (user's own sites, lab IPs, or targets they have written permission for). If asked to hack someone else without permission, refuse that part and explain the authorized alternative. Give clear plans, severity, and fixes. Never invent scan results - use only the scan JSON provided, and say when something is unverified." }] }, contents: [{ parts: [{ text: prompt }] }] })
-        });
-        const j = await r.json();
-        const text = j?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("");
-        if (r.ok && text) return { text, model: m };
-        const errMsg = j?.error?.message || `HTTP ${r.status}`;
-        const status = j?.error?.status || "";
-        if (/API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(errMsg + status)) {
-          throw new Error("Gemini API key invalid ya permission nahi hai. Settings me key dobara check karo, aur agar key chat me share hui thi to Google AI Studio se rotate karke nayi key dalo.");
-        }
-        if (/404|not found|not supported/i.test(errMsg + status)) break; // next model, no retry
-        if (/503|429|overload|high demand|UNAVAILABLE|RESOURCE_EXHAUSTED/i.test(errMsg + status)) {
-          if (attempt === 0) { await new Promise(res => setTimeout(res, 2000)); continue; }
-          break; // next model
-        }
-        throw new Error(errMsg);
-      } catch (e) {
-        if (/API key invalid/i.test(e.message)) throw e;
-        if (attempt === 0 && /Failed to fetch|NetworkError/i.test(String(e))) { await new Promise(res => setTimeout(res, 1500)); continue; }
-        if (e.message && !/Gemini call fail/i.test(e.message)) throw e;
-        break;
-      }
-    }
+async function callGemini({ key, model, prompt, onTry }) {
+  // SPEED FIX: pehle 6 models x 2 attempts = 12 slow calls tak ja sakta tha, is liye reply late ata tha.
+  // Ab: max 3 models, har model par 20s timeout, models ke beech sirf 800ms, koi 2s backoff nahi.
+  // Order: selected model -> gemini-flash-latest -> gemini-2.5-flash (fast, kam overloaded)
+  const ordered = [];
+  for (const m of [model, "gemini-flash-latest", "gemini-2.5-flash", ...MODELS]) {
+    if (m && !ordered.includes(m)) ordered.push(m);
   }
-  throw new Error(`Sab models abhi overloaded / high demand de rahe hain (tried: ${tried.join(", ")}). Ye Google ki taraf se temporary hai, key ka masla nahi hai. 1-2 minute ruk kar dobara try karo, ya model dropdown se gemini-2.5-flash select karke dobara bhejo.`);
+  const tries = ordered.slice(0, 3);
+  for (const m of tries) {
+    if (onTry) onTry(m);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    try {
+      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(key)}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
+        body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, a defensive security assistant. Only help with authorized targets. If asked to hack someone else without permission, refuse that part. Give short plan, findings with severity, and fixes. Use only the scan findings provided." }] }, contents: [{ parts: [{ text: prompt }] }] })
+      });
+      clearTimeout(timer);
+      const j = await r.json();
+      const text = j?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("");
+      if (r.ok && text) return { text, model: m };
+      const errMsg = j?.error?.message || `HTTP ${r.status}`;
+      const status = j?.error?.status || "";
+      if (/API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(errMsg + status)) {
+        throw new Error("Gemini API key invalid ya permission nahi hai. Settings me key dobara check karo.");
+      }
+      // 404 / 503 / 429 sab par foran agla model, koi lambi wait nahi
+    } catch (e) {
+      clearTimeout(timer);
+      if (/API key invalid/i.test(e.message)) throw e;
+      // timeout / network / overload -> agla model
+    }
+    await new Promise(res => setTimeout(res, 800));
+  }
+  throw new Error(`Sab try kiye hue models slow / overloaded the (tried: ${tries.join(", ")}). Ye temporary hai. 1 minute baad dobara try karo, ya gemini-2.5-flash select karo.`);
 }
 
 export default function Home() {
@@ -100,12 +100,12 @@ export default function Home() {
         pushMsg(id, { role: "agent", text: "🛡️ Plan ban raha hai, phir sandbox me scan chal raha hai...", status: true });
         const r = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: text, target, permission }), signal: controller.signal });
         scan = await r.json();
-        scanNote = scan.blocked ? `GUARDRAIL BLOCKED: ${scan.reason}` : `SCAN RESULT (raw, verified by tool): ${JSON.stringify(scan)}`;
+        scanNote = scan.blocked ? `GUARDRAIL BLOCKED: ${scan.reason}` : `SCAN FINDINGS ONLY (full JSON evidence panel me hai): ${JSON.stringify(scan.findings || scan)}`;
       }
       let finalText = "", usedModel = "";
       if (key) {
         const prompt = `User task: ${text}\nTarget: ${target}\nPermission: ${permission}\n${scanNote}\n\nGive: 1) Short plan, 2) Findings with severity, 3) Fix steps, 4) What is still unverified. Use Roman Urdu simple language if user wrote in Roman Urdu, otherwise English. Keep it skimmable with headings and bullets.`;
-        const g = await callGemini({ key, model, prompt });
+        const g = await callGemini({ key, model, prompt, onTry: (m) => updateChat(id, c => ({ ...c, messages: c.messages.map(msg => msg.status ? { ...msg, text: `🛡️ ${m} se jawab la raha hun... (slow ho to agla model try hoga)` } : msg) })) });
         finalText = g.text; usedModel = g.model;
       } else {
         if (scan?.blocked) finalText = `⛔ Guardrail ne rok diya.\n\n${scan.reason}\n\nApni site ko allowlist me add karo (app/api/scan/route.js me ALLOWED_DOMAINS), ya demo ke liye example.com use karo.`;
