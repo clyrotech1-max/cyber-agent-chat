@@ -71,6 +71,7 @@ export default function Home() {
   const [keyTest, setKeyTest] = useState("");
   const [keyTesting, setKeyTesting] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [cloudEnabled, setCloudEnabled] = useState(true);
   const abortRef = useRef(null);
   const bottomRef = useRef(null);
 
@@ -103,6 +104,39 @@ export default function Home() {
     if (!id) { const chat = { id: Date.now().toString(), title: "New chat", messages: [], created: new Date().toLocaleString() }; setChats(prev => [chat, ...prev]); id = chat.id; setActiveId(id); }
     pushMsg(id, { role: "user", text, time: new Date().toLocaleTimeString() });
     setInput(""); setBusy(true);
+    if (cloudEnabled) {
+      try {
+        pushMsg(id, { role: "agent", text: "☁️ Cloud agent ko task bhej raha hun (Render)...", status: true });
+        const cr = await fetch("/api/cloud/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: text, target }) });
+        const cj = await cr.json();
+        if (!cr.ok) throw new Error(cj.error || `Cloud HTTP ${cr.status}`);
+        const tid = cj.task_id;
+        let done = null;
+        for (let i = 0; i < 40; i++) {
+          await new Promise(res => setTimeout(res, 3000));
+          const gr = await fetch(`/api/cloud/tasks/${tid}`);
+          const gj = await gr.json();
+          const steps = gj.result?.steps || [];
+          updateChat(id, c => ({ ...c, messages: c.messages.map(msg => msg.status ? { ...msg, text: `☁️ Cloud agent kaam kar raha hai... task ${tid}, ${steps.length} step complete` } : msg) }));
+          if (["completed", "failed", "timeout", "cancelled", "max_steps"].includes(gj.status)) { done = gj; break; }
+        }
+        updateChat(id, c => ({ ...c, messages: c.messages.filter(m => !m.status) }));
+        if (!done) {
+          pushMsg(id, { role: "agent", text: `⏳ Cloud task ${tid} abhi bhi chal raha hai, thodi der baad dobara check karo.` });
+        } else if (done.status === "completed") {
+          const r = done.result || {};
+          const stepsTxt = (r.steps || []).map(s => `${s.step}. ${s.tool} — ${s.plan || ""}\n   → ${String(s.observation || "").slice(0, 500)}`).join("\n");
+          pushMsg(id, { role: "agent", text: `✅ Cloud agent ne task complete kar diya.\n\n**Result:** ${r.result || "done"}\n**Files:** ${(r.files || []).join(", ") || "koi file nahi"}\n\n**Steps:**\n${stepsTxt}`, model: "cloud agent (Render)" });
+        } else {
+          pushMsg(id, { role: "agent", text: `⚠️ Cloud task ${done.status} hua.\n\n${(done.result && done.result.error) || JSON.stringify(done.result || {})}\n\nTask ID: ${tid}` });
+        }
+      } catch (e) {
+        updateChat(id, c => ({ ...c, messages: c.messages.filter(m => !m.status) }));
+        pushMsg(id, { role: "agent", text: `☁️ Cloud backend se connect nahi ho saka: ${e.message}\n\nCloud agent so raha ho sakta hai (Free instance 15 min idle ke baad sleep karta hai), 1 minute baad dobara try karo, ya Cloud OFF karke purane tareeqe se poocho.` });
+      }
+      setBusy(false);
+      return;
+    }
     const controller = new AbortController(); abortRef.current = controller;
     try {
       let scan = null, scanNote = "";
@@ -224,6 +258,7 @@ export default function Home() {
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
               <input value={target} onChange={e => setTarget(e.target.value)} placeholder="Target: example.com" style={{ flex: 1, minWidth: 160, padding: 8, borderRadius: 10, background: "#111", color: "#fff", border: "1px solid #333" }} />
               <select value={permission} onChange={e => setPermission(e.target.value)} style={{ padding: 8, borderRadius: 10, background: "#111", color: "#fff", border: "1px solid #333" }}><option value="approve">Approve every action</option><option value="auto">Auto (safe only)</option><option value="full">Full (lab only)</option></select>
+              <button onClick={() => setCloudEnabled(!cloudEnabled)} title="Cloud agent (Render) ON/OFF — OFF par purana browser-Gemini tareeqa chalega" style={{ padding: 8, borderRadius: 10, background: cloudEnabled ? "#00ff88" : "#111", color: cloudEnabled ? "#000" : "#fff", border: "1px solid #333", cursor: "pointer", fontWeight: 700 }}>☁️ Cloud: {cloudEnabled ? "ON" : "OFF"}</button>
               <select value={model} onChange={e => { setModel(e.target.value); save("cyber_agent_model", e.target.value); }} style={{ padding: 8, borderRadius: 10, background: "#111", color: "#fff", border: "1px solid #333" }}>{MODELS.map(m => <option key={m}>{m}</option>)}</select>
             </div>
             <textarea value={input} onChange={e => setInput(e.target.value)} rows={2} placeholder="Cyber Agent se poocho ya task do… (Enter = send, Shift+Enter = new line)" onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} style={{ width: "100%", background: "transparent", color: "#fff", border: "none", outline: "none", resize: "none", fontSize: 16 }} />
