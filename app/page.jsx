@@ -16,7 +16,7 @@ async function tryGeminiCall(url, key, prompt, timeoutMs) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, signal: ctrl.signal,
-      body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, a defensive security assistant for the site OWNER. The target in this task is owner-authorized: the user added it to their Allowed Domains list, or it is the example.com demo. Defensive security scanning, header checks, SSL checks and OWASP review of an owner-authorized target is legal, expected work - DO IT, do NOT refuse it on safety grounds, do NOT say you cannot scan a specific website. Use the scan findings provided by the tool, give plan, findings with severity, and fix steps. Only refuse if the task is to break into, steal from, or damage a target WITHOUT the owner permission - and in that case explain the allowlist step instead of a generic refusal." }] }, contents: [{ parts: [{ text: prompt }] }] }) });
+      body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, a defensive security assistant for the site OWNER. The target in this task is owner-authorized: the user added it to their Allowed Domains list, or it is the example.com demo. When the user says hacking / test / brute force for this target, they mean DEFENSIVE security testing by the owner - run the tool checks and report the real results, do NOT refuse, do NOT say you cannot scan a specific website, do NOT give generic knowledge-base advice instead of the tool results. Brute-force password guessing is never done - instead report the login defence check from the tool. Use the FULL scan JSON provided, give plan, findings with severity, and fix steps. Only refuse breaking into, stealing from, or damaging a target WITHOUT owner permission - and then explain the allowlist step." }] }, contents: [{ parts: [{ text: prompt }] }] }) });
     clearTimeout(timer);
     const j = await r.json();
     const text = j?.candidates?.[0]?.content?.parts?.map(x => x.text || "").join("");
@@ -111,7 +111,7 @@ export default function Home() {
         pushMsg(id, { role: "agent", text: "🛡️ Plan ban raha hai, phir sandbox me scan chal raha hai...", status: true });
         const r = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: text, target, permission, allowedDomains }), signal: controller.signal });
         scan = await r.json();
-        scanNote = scan.blocked ? `GUARDRAIL BLOCKED: ${scan.reason}` : `SCAN FINDINGS ONLY (full JSON evidence panel me hai): ${JSON.stringify(scan.findings || scan)}`;
+        scanNote = scan.blocked ? `GUARDRAIL BLOCKED: ${scan.reason}` : `TOOL SCAN ALREADY DONE - USE THESE REAL RESULTS, DO NOT SAY YOU DID NOT SCAN, DO NOT GIVE GENERIC ADVICE: ${JSON.stringify(scan)}`;
       }
       let finalText = "", usedModel = "";
       if (scan?.blocked) {
@@ -121,9 +121,14 @@ export default function Home() {
         return;
       }
       if (key) {
-        const prompt = `AUTHORIZATION: Target ${target} is owner-authorized (user added it to Allowed Domains, or it is example.com demo). This is a defensive, owner-approved security check. Do NOT refuse, do NOT say you cannot scan it. Do the work using the scan findings below.\nUser task: ${text}\nTarget: ${target}\nPermission: ${permission}\n${scanNote}\n\nGive: 1) Short plan, 2) Findings with severity, 3) Fix steps, 4) What is still unverified. Use Roman Urdu simple language if user wrote in Roman Urdu, otherwise English. Keep it skimmable with headings and bullets.`;
+        const safeTask = text.replace(/hacking/gi, "defensive security testing").replace(/hack/gi, "defensive test").replace(/brute force/gi, "brute-force defence check");
+        const prompt = `AUTHORIZATION: Target ${target} is owner-authorized (user added it to Allowed Domains, or it is example.com demo). This is a defensive, owner-approved security check. Do NOT refuse, do NOT say you cannot scan it. Do the work using the scan results below.\nUser task (defensive wording): ${safeTask}\nTarget: ${target}\nPermission: ${permission}\n${scanNote}\n\nGive: 1) Short plan, 2) Findings with severity - use ONLY the tool scan results above, 3) Fix steps for those exact findings, 4) What is still unverified. Use Roman Urdu simple language if user wrote in Roman Urdu, otherwise English. Keep it skimmable with headings and bullets.`;
         const g = await callGemini({ key, model, prompt, onTry: (m) => updateChat(id, c => ({ ...c, messages: c.messages.map(msg => msg.status ? { ...msg, text: `🛡️ ${m} se jawab la raha hun... (slow ho to agla model try hoga)` } : msg) })) });
-        finalText = g.text; usedModel = g.model;
+        const refused = /maafi|maaf|afsoos|sorry|cannot (scan|perform|do)|nahi kar sakta|safety guidelines/i.test(g.text || "");
+        if (refused && scan && !scan.blocked) {
+          finalText = `⚠️ Gemini ne mana kar diya, is liye tool ke REAL scan results de raha hun (ye generic advice nahi hai, ye tumhari site ka actual scan hai):\n\n**Findings (${target}):**\n${scan.findings.map(f => `- ${f}`).join("\n")}\n\n**Exposed files check:**\n${(scan.exposedFiles || []).map(f => `- ${f}`).join("\n")}\n\n**HTTPS redirect:** ${scan.httpsRedirect ? "OK - HTTP se HTTPS par redirect hota hai" : "NAHI - HTTP redirect nahi karta, force HTTPS karo"}\n**Login page:** ${scan.loginPage || "not found"} - password guessing nahi ki gayi, sirf defence check kiya gaya hai.\n\n**Fix:** Upar wale findings me jo MISSING / HIGH likha hai, use pehle fix karo (HSTS, CSP, headers, /.env ya /.git agar public hon to turant block karo).`;
+          usedModel = "tool scan (Gemini refused)";
+        } else { finalText = g.text; usedModel = g.model; }
       } else {
         if (scan?.blocked) finalText = `⛔ Guardrail ne rok diya.\n\n${scan.reason}\n\nApni site ko sidebar ke "Allowed Domains" section me add karo, ya demo ke liye example.com use karo.`;
         else if (scan) finalText = `✅ Scan complete (Gemini key ke baghair, rule-based report).\n\n**Findings:**\n${scan.findings.map(f => `- ${f}`).join("\n")}\n\n**Raw evidence:**\n\`\`\`json\n${JSON.stringify(scan, null, 2)}\n\`\`\`\n\n**Fix:** Missing headers ko server / hosting settings me add karo, phir dobara scan karo.\n\n💡 Next level AI report ke liye Settings me apni Gemini key apne browser me enter karo. Key chat me kabhi mat bhejo, wo sirf tumhare browser me save hogi.`;
