@@ -104,7 +104,26 @@ export default function Home() {
     if (!id) { const chat = { id: Date.now().toString(), title: "New chat", messages: [], created: new Date().toLocaleString() }; setChats(prev => [chat, ...prev]); id = chat.id; setActiveId(id); }
     pushMsg(id, { role: "user", text, time: new Date().toLocaleTimeString() });
     setInput(""); setBusy(true);
-    if (cloudEnabled) {
+    // "check <task_id>" dobara result dekhne ke liye
+    const checkMatch = text.match(/check\s+([0-9a-f]{12})/i);
+    if (checkMatch) {
+      try {
+        const gr = await fetch(`/api/cloud/tasks/${checkMatch[1]}`);
+        const gj = await gr.json();
+        if (gj.status === "completed") {
+          const r = gj.result || {};
+          const stepsTxt = (r.steps || []).map(s => `${s.step}. ${s.tool} — ${s.plan || ""}\n   → ${String(s.observation || "").slice(0, 500)}`).join("\n");
+          pushMsg(id, { role: "agent", text: `✅ Cloud task ${gj.task_id} complete hai.\n\n**Result:** ${r.result || "done"}\n**Files:** ${(r.files || []).join(", ") || "koi file nahi"}\n\n**Steps:**\n${stepsTxt}`, model: "cloud agent (Render)" });
+        } else {
+          pushMsg(id, { role: "agent", text: `⏳ Cloud task ${gj.task_id} abhi ${gj.status} hai. Thodi der baad dobara "check ${gj.task_id}" bhejo.` });
+        }
+      } catch (e) { pushMsg(id, { role: "agent", text: `Cloud task check nahi ho saka: ${e.message}` }); }
+      setBusy(false);
+      return;
+    }
+    // Simple greeting / sawal cloud task me nahi jayega - wo foran browser Gemini se jawab dega
+    const isSimpleChat = /^(hi+|hello|hey|salam|aoa|assalam|how are you|how're you|what can you do|tum kaun|kon ho|kya kar sakte|kya haal)/i.test(text) && !/scan|write|create|run|code|file|deploy|test|fix|banao|likho|chalao/i.test(text);
+    if (cloudEnabled && !isSimpleChat) {
       try {
         pushMsg(id, { role: "agent", text: "☁️ Cloud agent ko task bhej raha hun (Render)...", status: true });
         const cr = await fetch("/api/cloud/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: text, target }) });
@@ -112,7 +131,7 @@ export default function Home() {
         if (!cr.ok) throw new Error(cj.error || `Cloud HTTP ${cr.status}`);
         const tid = cj.task_id;
         let done = null;
-        for (let i = 0; i < 40; i++) {
+        for (let i = 0; i < 60; i++) {
           await new Promise(res => setTimeout(res, 3000));
           const gr = await fetch(`/api/cloud/tasks/${tid}`);
           const gj = await gr.json();
@@ -122,7 +141,7 @@ export default function Home() {
         }
         updateChat(id, c => ({ ...c, messages: c.messages.filter(m => !m.status) }));
         if (!done) {
-          pushMsg(id, { role: "agent", text: `⏳ Cloud task ${tid} abhi bhi chal raha hai, thodi der baad dobara check karo.` });
+          pushMsg(id, { role: "agent", text: `⏳ Cloud task ${tid} 3 minute se zyada le raha hai, is liye wait khatam kar raha hun — task cloud par abhi bhi chal raha hoga.\n\nDobara check karne ke liye ye bhejo:\ncheck ${tid}` });
         } else if (done.status === "completed") {
           const r = done.result || {};
           const stepsTxt = (r.steps || []).map(s => `${s.step}. ${s.tool} — ${s.plan || ""}\n   → ${String(s.observation || "").slice(0, 500)}`).join("\n");
