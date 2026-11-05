@@ -1,16 +1,19 @@
 const ALLOWED = new Set(["example.com", "example.org"]);
-function isAllowed(host) {
+function isAllowed(host, extra) {
   if (!host) return false;
-  if (ALLOWED.has(host)) return true;
+  const all = new Set([...ALLOWED, ...(extra || [])]);
+  for (const d of all) { if (host === d || host.endsWith("." + d)) return true; }
   if (host.startsWith("127.") || host.startsWith("10.") || host.startsWith("192.168.")) return true;
   return false;
 }
 export async function POST(req) {
   try {
-    const { target } = await req.json();
-    let host = String(target || "").replace(/^https?:\/\//, "").split("/")[0];
-    if (!isAllowed(host)) {
-      return Response.json({ blocked: true, reason: `Target allowlist me nahi hai: ${host}. Pehle ALLOWED_DOMAINS me apna domain add karo ya written permission lo.` }, { status: 403 });
+    const body = await req.json();
+    const { target } = body;
+    const extra = Array.isArray(body.allowedDomains) ? body.allowedDomains.filter(d => typeof d === "string" && /^[a-z0-9.-]+$/i.test(d)).map(d => d.toLowerCase()) : [];
+    let host = String(target || "").replace(/^https?:\/\//, "").split("/")[0].toLowerCase();
+    if (!isAllowed(host, extra)) {
+      return Response.json({ blocked: true, reason: `Target allowlist me nahi hai: ${host}. Sidebar ke "Allowed Domains" section me apna domain add karo, ya demo ke liye example.com use karo.` }, { status: 403 });
     }
     const url = `https://${host}/`;
     const res = await fetch(url, { headers: { "User-Agent": "CyberAgent-Web/0.1 (security-headers-check)" }, redirect: "follow" });
