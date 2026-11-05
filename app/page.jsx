@@ -11,42 +11,48 @@ const SUGGESTIONS = [
 function load(key, fallback) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; } }
 function save(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
 
+async function tryGeminiCall(url, key, prompt, timeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, signal: ctrl.signal,
+      body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, a defensive security assistant. Only help with authorized targets. If asked to hack someone else without permission, refuse that part. Give short plan, findings with severity, and fixes. Use only the scan findings provided." }] }, contents: [{ parts: [{ text: prompt }] }] }) });
+    clearTimeout(timer);
+    const j = await r.json();
+    const text = j?.candidates?.[0]?.content?.parts?.map(x => x.text || "").join("");
+    if (r.ok && text) return { text };
+    return { error: (j?.error?.message || `HTTP ${r.status}`) + " | " + (j?.error?.status || "") };
+  } catch (e) { clearTimeout(timer); return { error: String(e.message || e) }; }
+}
 async function callGemini({ key, model, prompt, onTry }) {
-  // SPEED FIX: pehle 6 models x 2 attempts = 12 slow calls tak ja sakta tha, is liye reply late ata tha.
-  // Ab: max 3 models, har model par 20s timeout, models ke beech sirf 800ms, koi 2s backoff nahi.
-  // Order: selected model -> gemini-flash-latest -> gemini-2.5-flash (fast, kam overloaded)
+  // SPEED FIX + AQ KEY FIX: key ab header (x-goog-api-key) se jati hai, ?key= se nahi.
+  // AQ. keys kuch accounts par Studio (generativelanguage) par 403 "unregistered callers" deti hain,
+  // wo Vertex Express (aiplatform) ki hoti hain - is liye 403 par Vertex bhi try hota hai.
+  // Max 3 models, har call 20s timeout, models ke beech 800ms.
   const ordered = [];
-  for (const m of [model, "gemini-flash-latest", "gemini-2.5-flash", ...MODELS]) {
-    if (m && !ordered.includes(m)) ordered.push(m);
-  }
+  for (const m of [model, "gemini-flash-latest", "gemini-2.5-flash", ...MODELS]) { if (m && !ordered.includes(m)) ordered.push(m); }
   const tries = ordered.slice(0, 3);
+  let lastErr = "";
   for (const m of tries) {
     if (onTry) onTry(m);
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20000);
-    try {
-      const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(key)}`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
-        body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, a defensive security assistant. Only help with authorized targets. If asked to hack someone else without permission, refuse that part. Give short plan, findings with severity, and fixes. Use only the scan findings provided." }] }, contents: [{ parts: [{ text: prompt }] }] })
-      });
-      clearTimeout(timer);
-      const j = await r.json();
-      const text = j?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("");
-      if (r.ok && text) return { text, model: m };
-      const errMsg = j?.error?.message || `HTTP ${r.status}`;
-      const status = j?.error?.status || "";
-      if (/API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(errMsg + status)) {
-        throw new Error("Gemini API key invalid ya permission nahi hai. Settings me key dobara check karo.");
-      }
-      // 404 / 503 / 429 sab par foran agla model, koi lambi wait nahi
-    } catch (e) {
-      clearTimeout(timer);
-      if (/API key invalid/i.test(e.message)) throw e;
-      // timeout / network / overload -> agla model
+    const studio = await tryGeminiCall(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, key, prompt, 20000);
+    if (studio.text) return { text: studio.text, model: m, surface: "AI Studio" };
+    lastErr = studio.error || "";
+    if (/API key not valid|API_KEY_INVALID/i.test(lastErr)) throw new Error("Gemini API key invalid hai. Settings me key dobara check karo, ya AI Studio se nayi key banao.");
+    if (/unregistered callers|PERMISSION_DENIED/i.test(lastErr)) {
+      if (onTry) onTry(m + " (Vertex try)");
+      const vx = await tryGeminiCall(`https://aiplatform.googleapis.com/v1beta1/publishers/google/models/${m}:generateContent`, key, prompt, 20000);
+      if (vx.text) return { text: vx.text, model: m, surface: "Vertex Express" };
+      lastErr = vx.error || lastErr;
     }
     await new Promise(res => setTimeout(res, 800));
   }
-  throw new Error(`Sab try kiye hue models slow / overloaded the (tried: ${tries.join(", ")}). Ye temporary hai. 1 minute baad dobara try karo, ya gemini-2.5-flash select karo.`);
+  throw new Error(`Gemini se jawab nahi aya (tried: ${tries.join(", ")}). Last error: ${lastErr.slice(0,200)} Agar 403 "unregistered callers" hai to ye key is surface par kaam nahi karti - AI Studio (aistudio.google.com/apikey) se AIza... wali nayi key banao aur Settings me dalo.`);
+}
+async function testGeminiKey(key, model) {
+  const t0 = Date.now();
+  try { const g = await callGemini({ key, model, prompt: "Say 'OK fast' in Roman Urdu, one line only." }); return `OK ${((Date.now()-t0)/1000).toFixed(1)}s - model: ${g.model} (${g.surface || "Studio"}) - ${g.text.slice(0,120)}`; }
+  catch (e) { return `FAIL ${((Date.now()-t0)/1000).toFixed(1)}s - ${e.message}`; }
 }
 
 export default function Home() {
@@ -60,6 +66,10 @@ export default function Home() {
   const [showSettings, setShowSettings] = useState(false);
   const [showSidebar, setShowSidebar] = useState(true);
   const [search, setSearch] = useState("");
+  const [allowedDomains, setAllowedDomains] = useState(["example.com"]);
+  const [newDomain, setNewDomain] = useState("");
+  const [keyTest, setKeyTest] = useState("");
+  const [keyTesting, setKeyTesting] = useState(false);
   const [busy, setBusy] = useState(false);
   const abortRef = useRef(null);
   const bottomRef = useRef(null);
@@ -67,9 +77,10 @@ export default function Home() {
   useEffect(() => {
     const c = load("cyber_agent_chats", []);
     setChats(c); setActiveId(c[0]?.id || null);
-    setKey(load("cyber_agent_gemini_key", "")); setModel(load("cyber_agent_model", MODELS[0]));
+    setKey(load("cyber_agent_gemini_key", "")); setModel(load("cyber_agent_model", MODELS[0])); setAllowedDomains(load("cyber_agent_allowed_domains", ["example.com"]));
   }, []);
   useEffect(() => { save("cyber_agent_chats", chats); }, [chats]);
+  useEffect(() => { save("cyber_agent_allowed_domains", allowedDomains); }, [allowedDomains]);
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chats, busy]);
 
   const active = chats.find(c => c.id === activeId) || null;
@@ -98,7 +109,7 @@ export default function Home() {
       const looksLikeScan = /scan|header|ssl|security|recon/i.test(text);
       if (looksLikeScan && target) {
         pushMsg(id, { role: "agent", text: "🛡️ Plan ban raha hai, phir sandbox me scan chal raha hai...", status: true });
-        const r = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: text, target, permission }), signal: controller.signal });
+        const r = await fetch("/api/scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task: text, target, permission, allowedDomains }), signal: controller.signal });
         scan = await r.json();
         scanNote = scan.blocked ? `GUARDRAIL BLOCKED: ${scan.reason}` : `SCAN FINDINGS ONLY (full JSON evidence panel me hai): ${JSON.stringify(scan.findings || scan)}`;
       }
@@ -108,7 +119,7 @@ export default function Home() {
         const g = await callGemini({ key, model, prompt, onTry: (m) => updateChat(id, c => ({ ...c, messages: c.messages.map(msg => msg.status ? { ...msg, text: `🛡️ ${m} se jawab la raha hun... (slow ho to agla model try hoga)` } : msg) })) });
         finalText = g.text; usedModel = g.model;
       } else {
-        if (scan?.blocked) finalText = `⛔ Guardrail ne rok diya.\n\n${scan.reason}\n\nApni site ko allowlist me add karo (app/api/scan/route.js me ALLOWED_DOMAINS), ya demo ke liye example.com use karo.`;
+        if (scan?.blocked) finalText = `⛔ Guardrail ne rok diya.\n\n${scan.reason}\n\nApni site ko sidebar ke "Allowed Domains" section me add karo, ya demo ke liye example.com use karo.`;
         else if (scan) finalText = `✅ Scan complete (Gemini key ke baghair, rule-based report).\n\n**Findings:**\n${scan.findings.map(f => `- ${f}`).join("\n")}\n\n**Raw evidence:**\n\`\`\`json\n${JSON.stringify(scan, null, 2)}\n\`\`\`\n\n**Fix:** Missing headers ko server / hosting settings me add karo, phir dobara scan karo.\n\n💡 Next level AI report ke liye Settings me apni Gemini key apne browser me enter karo. Key chat me kabhi mat bhejo, wo sirf tumhare browser me save hogi.`;
         else finalText = `Main Cyber Agent hun, defensive security assistant.\n\nTum mujhse pooch sakte ho: OWASP Top 10, security headers ka fix, log analysis, ya kisi authorized site ka scan.\n\nScan ke liye upar Target me apni site likho aur message me "scan karo" likho. Gemini key ke baghair main rule-based report dunga, key lagane par Gemini plan + detailed report dega (Settings me).`;
       }
@@ -143,6 +154,22 @@ export default function Home() {
               </div>
             ))}
             {!filtered.length && <p style={{ color: "#888", fontSize: 13 }}>Koi chat nahi. New chat se shuru karo.</p>}
+          </div>
+          <div style={{ borderTop: "1px solid #222", paddingTop: 10 }}>
+            <b style={{ fontSize: 13 }}>✅ Allowed Domains</b>
+            <p style={{ fontSize: 11, color: "#888", margin: "4px 0" }}>Sirf in domains ka scan hoga. Apni site yahan add karo.</p>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input value={newDomain} onChange={e => setNewDomain(e.target.value)} onKeyDown={e => { if (e.key === "Enter") { const d = newDomain.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0]; if (d && !allowedDomains.includes(d)) setAllowedDomains([...allowedDomains, d]); setNewDomain(""); } }} placeholder="example: dailyhayat.net" style={{ flex: 1, minWidth: 0, padding: 8, borderRadius: 8, background: "#1a1a1a", color: "#fff", border: "1px solid #333", fontSize: 12 }} />
+              <button onClick={() => { const d = newDomain.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0]; if (d && !allowedDomains.includes(d)) setAllowedDomains([...allowedDomains, d]); setNewDomain(""); }} style={{ padding: "8px 10px", borderRadius: 8, background: "#00ff88", color: "#000", fontWeight: 800, border: "none", cursor: "pointer" }}>Add</button>
+            </div>
+            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+              {allowedDomains.map(d => (
+                <div key={d} style={{ display: "flex", justifyContent: "space-between", background: "#1a1a1a", padding: "6px 10px", borderRadius: 8, fontSize: 12 }}>
+                  <span>{d}</span>
+                  <button onClick={() => setAllowedDomains(allowedDomains.filter(x => x !== d))} style={{ background: "none", border: "none", color: "#888", cursor: "pointer" }}>×</button>
+                </div>
+              ))}
+            </div>
           </div>
           <button onClick={() => setShowSettings(true)} style={{ padding: 10, borderRadius: 10, background: "#1a1a1a", color: "#fff", border: "1px solid #333", cursor: "pointer" }}>⚙️ Settings — Gemini key & model</button>
           <p style={{ fontSize: 11, color: "#777" }}>Authorized targets only. Bina permission wale target par agent ruk jayega.</p>
@@ -204,7 +231,11 @@ export default function Home() {
               <button onClick={() => { save("cyber_agent_gemini_key", key); setShowSettings(false); }} style={{ padding: 12, borderRadius: 10, background: "#00ff88", color: "#000", fontWeight: 800, border: "none", cursor: "pointer", flex: 1 }}>Save in this browser</button>
               <button onClick={() => { setKey(""); save("cyber_agent_gemini_key", ""); }} style={{ padding: 12, borderRadius: 10, background: "#222", color: "#fff", border: "1px solid #444", cursor: "pointer" }}>Clear</button>
             </div>
-            <p style={{ fontSize: 12, color: "#888" }}>Model fallback: 404 par foran agla model, 503 / high demand par 2 second ruk kar retry phir agla model. Jo model jawab dega, uska naam jawab ke neeche dikhega.</p>
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <button disabled={!key || keyTesting} onClick={async () => { setKeyTesting(true); setKeyTest("Testing..."); const r = await testGeminiKey(key, model); setKeyTest(r); setKeyTesting(false); }} style={{ padding: 10, borderRadius: 10, background: "#222", color: "#fff", border: "1px solid #444", cursor: "pointer", flex: 1 }}>🔑 Key test karo (is browser me)</button>
+            </div>
+            {keyTest && <p style={{ fontSize: 12, color: "#aaa", whiteSpace: "pre-wrap" }}>{keyTest}</p>}
+            <p style={{ fontSize: 12, color: "#888" }}>Model fallback: 404 par foran agla model, 503 / high demand par retry phir agla model. AQ. key 403 de to Vertex Express bhi try hota hai. Jo model jawab dega, uska naam jawab ke neeche dikhega.</p>
           </div>
         </div>
       )}
