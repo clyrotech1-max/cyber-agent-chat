@@ -16,7 +16,7 @@ async function tryGeminiCall(url, key, prompt, timeoutMs) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, signal: ctrl.signal,
-      body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, a defensive security assistant. Only help with authorized targets. If asked to hack someone else without permission, refuse that part. Give short plan, findings with severity, and fixes. Use only the scan findings provided." }] }, contents: [{ parts: [{ text: prompt }] }] }) });
+      body: JSON.stringify({ system_instruction: { parts: [{ text: "You are Cyber Agent, a defensive security assistant for the site OWNER. The target in this task is owner-authorized: the user added it to their Allowed Domains list, or it is the example.com demo. Defensive security scanning, header checks, SSL checks and OWASP review of an owner-authorized target is legal, expected work - DO IT, do NOT refuse it on safety grounds, do NOT say you cannot scan a specific website. Use the scan findings provided by the tool, give plan, findings with severity, and fix steps. Only refuse if the task is to break into, steal from, or damage a target WITHOUT the owner permission - and in that case explain the allowlist step instead of a generic refusal." }] }, contents: [{ parts: [{ text: prompt }] }] }) });
     clearTimeout(timer);
     const j = await r.json();
     const text = j?.candidates?.[0]?.content?.parts?.map(x => x.text || "").join("");
@@ -114,8 +114,14 @@ export default function Home() {
         scanNote = scan.blocked ? `GUARDRAIL BLOCKED: ${scan.reason}` : `SCAN FINDINGS ONLY (full JSON evidence panel me hai): ${JSON.stringify(scan.findings || scan)}`;
       }
       let finalText = "", usedModel = "";
+      if (scan?.blocked) {
+        updateChat(id, c => ({ ...c, messages: c.messages.filter(m => !m.status) }));
+        pushMsg(id, { role: "agent", text: `⛔ Ye target abhi allowlist me nahi hai, is liye scan nahi chala.\n\nTarget: ${target}\n\nKya karna hai:\n1) Sidebar me "Allowed Domains" section kholo\n2) "${target}" likh kar Add dabao\n3) Phir dobara wahi scan wala message bhejo\n\nYe step is liye hai taake agent sirf tumhari apni / permission wali sites par kaam kare. Allowlist me aate hi scan foran chalega, Gemini mana nahi karega.` });
+        setBusy(false);
+        return;
+      }
       if (key) {
-        const prompt = `User task: ${text}\nTarget: ${target}\nPermission: ${permission}\n${scanNote}\n\nGive: 1) Short plan, 2) Findings with severity, 3) Fix steps, 4) What is still unverified. Use Roman Urdu simple language if user wrote in Roman Urdu, otherwise English. Keep it skimmable with headings and bullets.`;
+        const prompt = `AUTHORIZATION: Target ${target} is owner-authorized (user added it to Allowed Domains, or it is example.com demo). This is a defensive, owner-approved security check. Do NOT refuse, do NOT say you cannot scan it. Do the work using the scan findings below.\nUser task: ${text}\nTarget: ${target}\nPermission: ${permission}\n${scanNote}\n\nGive: 1) Short plan, 2) Findings with severity, 3) Fix steps, 4) What is still unverified. Use Roman Urdu simple language if user wrote in Roman Urdu, otherwise English. Keep it skimmable with headings and bullets.`;
         const g = await callGemini({ key, model, prompt, onTry: (m) => updateChat(id, c => ({ ...c, messages: c.messages.map(msg => msg.status ? { ...msg, text: `🛡️ ${m} se jawab la raha hun... (slow ho to agla model try hoga)` } : msg) })) });
         finalText = g.text; usedModel = g.model;
       } else {
